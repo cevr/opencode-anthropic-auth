@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { createHash } from 'node:crypto'
+import { betasFor } from './betas.ts'
 import { buildBillingHeaderValue } from './cch.ts'
 import {
   CLAUDE_CODE_ENTRYPOINT,
@@ -8,7 +9,6 @@ import {
   formatUserAgent,
   OPENCODE_IDENTITY_PREFIX,
   PARAGRAPH_REMOVAL_ANCHORS,
-  REQUIRED_BETAS,
   TEXT_REPLACEMENTS,
   TOOL_PREFIX,
 } from './constants.ts'
@@ -254,16 +254,17 @@ export function mergeHeaders(input: FetchInput, init?: RequestInit): Headers {
 }
 
 /**
- * Merge incoming beta headers with the required OAuth betas, deduplicating.
+ * Merge incoming beta headers with the model's Claude Code betas
+ * (`betasFor`), deduplicating.
  */
-export function mergeBetaHeaders(headers: Headers): string {
+export function mergeBetaHeaders(headers: Headers, modelID?: string): string {
   const incomingBeta = headers.get('anthropic-beta') || ''
   const incomingBetasList = incomingBeta
     .split(',')
     .map((b) => b.trim())
     .filter(Boolean)
 
-  return [...new Set([...REQUIRED_BETAS, ...incomingBetasList])].join(',')
+  return betasFor(modelID, incomingBetasList).join(',')
 }
 
 /**
@@ -274,9 +275,10 @@ export function setOAuthHeaders(
   headers: Headers,
   accessToken: string,
   version: string = CLAUDE_CODE_VERSION,
+  modelID?: string,
 ): Headers {
   headers.set('authorization', `Bearer ${accessToken}`)
-  headers.set('anthropic-beta', mergeBetaHeaders(headers))
+  headers.set('anthropic-beta', mergeBetaHeaders(headers, modelID))
   headers.set('user-agent', formatUserAgent(version))
   headers.delete('x-api-key')
   return headers
@@ -741,6 +743,14 @@ function resolveBaseUrl(): URL | null {
   } catch {
     return null
   }
+}
+
+/**
+ * An Anthropic API path on the configured custom endpoint's origin, or on
+ * the official API's when none is configured (or it is invalid).
+ */
+export function anthropicApiUrl(path: string): URL {
+  return new URL(path, resolveBaseUrl()?.origin ?? 'https://api.anthropic.com')
 }
 
 /**

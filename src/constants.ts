@@ -21,10 +21,8 @@ export const OAUTH_SCOPES = [
 
 export const TOOL_PREFIX = 'mcp_'
 
-export const REQUIRED_BETAS = [
-  'oauth-2025-04-20',
-  'interleaved-thinking-2025-05-14',
-]
+/** The betas every OAuth request carries, whatever its model (`betas.ts`). */
+export const REQUIRED_BETAS = ['claude-code-20250219', 'oauth-2025-04-20']
 
 export const OPENCODE_IDENTITY_PREFIX = 'You are OpenCode'
 export const CLAUDE_CODE_IDENTITY =
