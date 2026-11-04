@@ -79,7 +79,7 @@ const UNKNOWN_CONNECTION = 'Unknown OAuth connection'
  * credential a request goes out on: a connection id of the `anthropic`
  * integration. It never reaches Anthropic.
  */
-export const CREDENTIAL_HEADER = 'x-opencode-credential-id'
+const CREDENTIAL_HEADER = 'x-opencode-credential-id'
 const MAX_QUOTA_CREDENTIALS = 256
 /** A 401 holds the credential until the host refreshes it: this long before it expires. */
 const HOST_REFRESH_WINDOW_MS = 5 * 60_000
