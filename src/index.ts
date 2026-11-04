@@ -567,10 +567,15 @@ export default Plugin.define({
             source,
           }
         } catch (error) {
-          refuse(credentialID, {
-            kind: 'signin',
-            until: retryAtOf(error) ?? Date.now() + SIGNIN_RETRY_MS,
-          })
+          // A failure with a retry time passes on its own (a rate limit, a
+          // busy store); one without needs the owner to sign in again.
+          const retryAt = retryAtOf(error)
+          refuse(
+            credentialID,
+            retryAt === undefined
+              ? { kind: 'signin', until: Date.now() + SIGNIN_RETRY_MS }
+              : { kind: 'rate-limit', until: retryAt },
+          )
           throw error
         }
       }

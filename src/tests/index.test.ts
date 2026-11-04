@@ -3777,7 +3777,7 @@ describe('credential choice, wire extras and quota readings', () => {
       }
     })
 
-    test("a source's failure refuses the credential until its retryAt, and the request fails", async () => {
+    test("a source's passing failure holds the credential as rate-limited until its retryAt, and the request fails", async () => {
       const retryAt = Date.now() + 60_000
       const { ctx, sessionHooks, rpcEvents, remove } = withSource(async () => {
         throw Object.assign(new Error('token endpoint unavailable'), {
@@ -3800,7 +3800,34 @@ describe('credential choice, wire extras and quota readings', () => {
         expect(rpcEvents.at(-1)!.payload).toEqual({
           credentialID: 'src:one',
           reading: expect.objectContaining({
-            refusal: { kind: 'signin', until: retryAt },
+            refusal: { kind: 'rate-limit', until: retryAt },
+          }),
+        })
+      } finally {
+        remove()
+      }
+    })
+
+    test("a source's failure without a retry time asks for a new sign-in", async () => {
+      const { ctx, sessionHooks, rpcEvents, remove } = withSource(async () => {
+        throw new Error('refresh token rejected')
+      })
+      try {
+        await plugin.setup(ctx as any)
+        const event: any = {
+          sessionID: 'ses_one',
+          model,
+          kind: 'primary',
+          request: messagesRequest({ 'x-opencode-credential-id': 'src:one' }),
+        }
+
+        await expect(sessionHooks.get('http.request')!(event)).rejects.toThrow(
+          'refresh token rejected',
+        )
+        expect(rpcEvents.at(-1)!.payload).toEqual({
+          credentialID: 'src:one',
+          reading: expect.objectContaining({
+            refusal: { kind: 'signin', until: expect.any(Number) },
           }),
         })
       } finally {
