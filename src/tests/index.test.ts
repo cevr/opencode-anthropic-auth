@@ -1,6 +1,7 @@
 import { describe, expect, mock, spyOn, test } from 'bun:test'
 import { ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR } from '../config'
 import { CLAUDE_CODE_VERSION, REQUIRED_BETAS } from '../constants'
+import { CREDENTIAL_SOURCES } from '../credential-sources'
 import plugin from '../index'
 import { describeConnection } from '../rate-limit'
 
@@ -3708,5 +3709,192 @@ describe('credential choice, wire extras and quota readings', () => {
     } finally {
       fetchSpy.mockRestore()
     }
+  })
+
+  describe('a credential another plugin keeps (a credential source)', () => {
+    type Registry = Map<string, Set<unknown>>
+    const registry = (): Registry => {
+      const global = globalThis as unknown as Record<symbol, Registry>
+      global[CREDENTIAL_SOURCES] ??= new Map()
+      return global[CREDENTIAL_SOURCES]
+    }
+
+    function withSource(
+      resolve: (id: string) => Promise<{ access: string; expires: number }>,
+    ) {
+      const mocked = twoAccounts()
+      const rejected: Array<[string, string]> = []
+      const source = {
+        owns: (id: string) => id.startsWith('src:'),
+        resolve: mock(resolve),
+        rejected: (id: string, access: string) => rejected.push([id, access]),
+      }
+      const sources = registry().get('anthropic') ?? new Set()
+      registry().set('anthropic', sources)
+      sources.add(source)
+      const remove = () => sources.delete(source)
+      return { ...mocked, source, rejected, remove }
+    }
+
+    test('sends on the token the source resolves, and never asks the host to resolve or refresh it', async () => {
+      const access = `fixture-sourced-${crypto.randomUUID()}`
+      const { ctx, sessionHooks, source, remove } = withSource(async () => ({
+        access,
+        expires: Date.now() + HOUR,
+      }))
+      try {
+        await plugin.setup(ctx as any)
+        const sent = await send(sessionHooks, {
+          'x-opencode-credential-id': 'src:one',
+        })
+
+        expect(sent.headers.get('authorization')).toBe(`Bearer ${access}`)
+        expect(sent.headers.has('x-opencode-credential-id')).toBe(false)
+        expect(source.resolve).toHaveBeenCalledWith('src:one')
+        expect(ctx.integration.get).not.toHaveBeenCalled()
+        expect(ctx.integration.connection.resolve).not.toHaveBeenCalled()
+      } finally {
+        remove()
+      }
+    })
+
+    test("a credential no source owns still goes through the host's connections", async () => {
+      const { ctx, sessionHooks, accessOf, source, remove } = withSource(
+        async () => ({ access: 'unused', expires: Date.now() + HOUR }),
+      )
+      try {
+        await plugin.setup(ctx as any)
+        const sent = await send(sessionHooks, {
+          'x-opencode-credential-id': 'cred-b',
+        })
+
+        expect(sent.headers.get('authorization')).toBe(
+          `Bearer ${accessOf['cred-b']}`,
+        )
+        expect(source.resolve).not.toHaveBeenCalled()
+      } finally {
+        remove()
+      }
+    })
+
+    test("a source's failure refuses the credential until its retryAt, and the request fails", async () => {
+      const retryAt = Date.now() + 60_000
+      const { ctx, sessionHooks, rpcEvents, remove } = withSource(async () => {
+        throw Object.assign(new Error('token endpoint unavailable'), {
+          retryAt,
+        })
+      })
+      try {
+        await plugin.setup(ctx as any)
+        const event: any = {
+          sessionID: 'ses_one',
+          model,
+          kind: 'primary',
+          request: messagesRequest({ 'x-opencode-credential-id': 'src:one' }),
+        }
+
+        await expect(sessionHooks.get('http.request')!(event)).rejects.toThrow(
+          'token endpoint unavailable',
+        )
+        expect(event.request.headers.has('authorization')).toBe(false)
+        expect(rpcEvents.at(-1)!.payload).toEqual({
+          credentialID: 'src:one',
+          reading: expect.objectContaining({
+            refusal: { kind: 'signin', until: retryAt },
+          }),
+        })
+      } finally {
+        remove()
+      }
+    })
+
+    test('an answer without a usable token fails the request', async () => {
+      const { ctx, sessionHooks, remove } = withSource(async () => ({
+        access: '',
+        expires: Date.now() + HOUR,
+      }))
+      try {
+        await plugin.setup(ctx as any)
+        const event: any = {
+          sessionID: 'ses_one',
+          model,
+          kind: 'primary',
+          request: messagesRequest({ 'x-opencode-credential-id': 'src:one' }),
+        }
+
+        await expect(sessionHooks.get('http.request')!(event)).rejects.toThrow(
+          'without a usable token',
+        )
+      } finally {
+        remove()
+      }
+    })
+
+    test('a 401 tells the source which token was rejected, and holds the credential only briefly', async () => {
+      const access = `fixture-sourced-${crypto.randomUUID()}`
+      const { ctx, sessionHooks, rpcEvents, rejected, remove } = withSource(
+        async () => ({ access, expires: Date.now() + 8 * HOUR }),
+      )
+      try {
+        await plugin.setup(ctx as any)
+        const sent = await send(sessionHooks, {
+          'x-opencode-credential-id': 'src:one',
+        })
+        const before = Date.now()
+
+        await answer(
+          sessionHooks,
+          sent,
+          Response.json(
+            {
+              type: 'error',
+              error: { type: 'authentication_error', message: 'invalid' },
+            },
+            { status: 401 },
+          ),
+        )
+
+        expect(rejected).toEqual([['src:one', access]])
+        const refusal = rpcEvents.at(-1)!.payload.reading.refusal
+        expect(refusal.kind).toBe('unauthorized')
+        expect(refusal.until).toBeGreaterThanOrEqual(before + 60_000)
+        expect(refusal.until).toBeLessThanOrEqual(Date.now() + 60_000)
+      } finally {
+        remove()
+      }
+    })
+
+    test("the usage read uses the source's token", async () => {
+      const access = `fixture-sourced-${crypto.randomUUID()}`
+      const { ctx, rpcHandlers, remove } = withSource(async () => ({
+        access,
+        expires: Date.now() + HOUR,
+      }))
+      const seen: Request[] = []
+      const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (
+        input: string | URL | Request,
+        init?: RequestInit,
+      ) => {
+        seen.push(new Request(input as string, init))
+        return Response.json({
+          five_hour: { utilization: 10, resets_at: null },
+          seven_day: { utilization: 20, resets_at: null },
+        })
+      }) as typeof fetch)
+      try {
+        await plugin.setup(ctx as any)
+        const answered = (await rpcHandlers.get('credential-quota.anthropic')!
+          .usage!({ credentialID: 'src:one' })) as any
+
+        expect(seen[0]!.headers.get('authorization')).toBe(`Bearer ${access}`)
+        expect(answered.reading.windows).toEqual([
+          { name: '5h', utilization: 0.1 },
+          { name: '7d', utilization: 0.2 },
+        ])
+      } finally {
+        fetchSpy.mockRestore()
+        remove()
+      }
+    })
   })
 })

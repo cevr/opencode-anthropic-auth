@@ -15,6 +15,12 @@ import {
   REQUIRED_BETAS,
 } from './constants.ts'
 import {
+  type CredentialSource,
+  credentialSource,
+  resolveSourced,
+  retryAtOf,
+} from './credential-sources.ts'
+import {
   type QuotaReading,
   type QuotaRefusal,
   quotaProtocol,
@@ -208,7 +214,9 @@ type OAuthConnection = {
 
 type ResolvedOAuth = {
   readonly connection: OAuthConnection
-  readonly credential: Credential.OAuth
+  readonly credential: { readonly access: string; readonly expires: number }
+  /** The plugin that keeps the credential, when OpenCode's store does not. */
+  readonly source?: CredentialSource
 }
 
 function connectionID(connection: OAuthConnection): string | undefined {
@@ -538,12 +546,34 @@ export default Plugin.define({
     /**
      * The OAuth login to send a request on: the chosen credential when
      * another plugin named one, else the integration's active connection.
-     * A login whose token cannot be resolved (its refresh failed) is refused
-     * for a while, so a pool places no request on it.
+     * A credential a registered source keeps comes from that source, which
+     * refreshes it; this plugin never does. A login whose token cannot be
+     * resolved (its refresh failed) is refused for a while, so a pool places
+     * no request on it.
      */
     const resolveOAuth = async (
       credentialID: string | undefined,
     ): Promise<ResolvedOAuth | undefined> => {
+      const source =
+        credentialID === undefined
+          ? undefined
+          : credentialSource(INTEGRATION_ID, credentialID)
+      if (credentialID !== undefined && source !== undefined) {
+        try {
+          const credential = await resolveSourced(source, credentialID)
+          return {
+            connection: { type: 'credential', id: credentialID },
+            credential,
+            source,
+          }
+        } catch (error) {
+          refuse(credentialID, {
+            kind: 'signin',
+            until: retryAtOf(error) ?? Date.now() + SIGNIN_RETRY_MS,
+          })
+          throw error
+        }
+      }
       const connection =
         credentialID === undefined
           ? await ctx.integration.connection.active(INTEGRATION_ID)
@@ -854,11 +884,15 @@ export default Plugin.define({
       const now = Date.now()
       if (response.status === 401) {
         await response.body?.cancel()
+        active.source?.rejected?.(credentialID, active.credential.access)
         refuse(credentialID, {
           kind: 'unauthorized',
+          // A source refreshes the rejected token on its next resolve.
           until: Math.max(
             now + MIN_UNAUTHORIZED_HOLD_MS,
-            active.credential.expires - HOST_REFRESH_WINDOW_MS,
+            active.source
+              ? 0
+              : active.credential.expires - HOST_REFRESH_WINDOW_MS,
           ),
         })
         return readings.get(credentialID)
@@ -1110,6 +1144,13 @@ export default Plugin.define({
           category = enhanced.category
         }
         if (credentialID !== undefined) {
+          if (status === 401) {
+            const bearer = event.request.headers
+              .get('authorization')
+              ?.replace(/^Bearer /, '')
+            const source = credentialSource(INTEGRATION_ID, credentialID)
+            if (bearer) source?.rejected?.(credentialID, bearer)
+          }
           const refusal = refusalOf({
             status,
             category,
