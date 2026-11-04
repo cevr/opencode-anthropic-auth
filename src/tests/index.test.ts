@@ -25,7 +25,32 @@ function createMockContext() {
   const commandDefinitions: Array<Record<string, unknown>> = []
   const sessionHooks = new Map<string, (event: any) => Promise<void> | void>()
   const syntheticMessages: Array<Record<string, unknown>> = []
+  const rpcHandlers = new Map<
+    string,
+    Record<string, (input: unknown) => Promise<unknown>>
+  >()
+  const rpcEvents: Array<{ id: string; name: string; payload: any }> = []
+  const connections: Array<{ type: 'credential'; id: string; label: string }> =
+    []
   const ctx = {
+    rpc: {
+      register: mock(
+        async (
+          definition: { id: string },
+          handlers: Record<string, (input: unknown) => Promise<unknown>>,
+        ) => {
+          rpcHandlers.set(definition.id, handlers)
+          return {
+            events: {
+              emit: mock(async (name: string, payload: unknown) => {
+                rpcEvents.push({ id: definition.id, name, payload })
+              }),
+            },
+            dispose: mock(async () => {}),
+          }
+        },
+      ),
+    },
     command: {
       transform: mock(async (cb: (draft: any) => void) => {
         cb({
@@ -48,6 +73,15 @@ function createMockContext() {
         cb(draft)
         return { dispose: mock(async () => {}) }
       }),
+      get: mock(async (_input: { integrationID: string }) => ({
+        location: {},
+        data: {
+          id: 'anthropic',
+          name: 'Anthropic',
+          methods: [],
+          connections,
+        },
+      })),
       connection: {
         active: mock(
           async (_id: string): Promise<{ id: string } | undefined> => undefined,
@@ -73,6 +107,9 @@ function createMockContext() {
 
   return {
     ctx,
+    connections,
+    rpcEvents,
+    rpcHandlers,
     commandDefinitions,
     integrationMethods,
     sessionHooks,
@@ -3265,5 +3302,411 @@ describe('multiple Anthropic connections and HTTP 429', () => {
       2,
       connectionB,
     )
+  })
+})
+
+describe('credential choice, wire extras and quota readings', () => {
+  const HOUR = 3_600_000
+  const seconds = (ms: number) => String(Math.floor(ms / 1000))
+
+  function twoAccounts() {
+    const mocked = createMockContext()
+    const accessOf: Record<string, string> = {
+      'cred-a': `fixture-access-a-${crypto.randomUUID()}`,
+      'cred-b': `fixture-access-b-${crypto.randomUUID()}`,
+    }
+    const expires = Date.now() + 8 * HOUR
+    mocked.connections.push(
+      { type: 'credential', id: 'cred-a', label: 'Anthropic 1' },
+      { type: 'credential', id: 'cred-b', label: 'Anthropic 2' },
+    )
+    ;(mocked.ctx.integration.connection.active as any).mockImplementation(
+      async () => mocked.connections[0],
+    )
+    ;(mocked.ctx.integration.connection.resolve as any).mockImplementation(
+      async (connection: { id: string }) => ({
+        type: 'oauth',
+        methodID: 'claude-max',
+        refresh: `fixture-refresh-${connection.id}`,
+        access: accessOf[connection.id],
+        expires,
+      }),
+    )
+    return { ...mocked, accessOf, expires }
+  }
+
+  const model = { providerID: 'anthropic', id: 'claude-sonnet-4-5' }
+
+  function messagesRequest(headers: Record<string, string> = {}): Request {
+    return new Request('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify({
+        model: model.id,
+        messages: [{ role: 'user', content: crypto.randomUUID() }],
+      }),
+    })
+  }
+
+  async function send(
+    hooks: Map<string, (event: any) => Promise<void> | void>,
+    headers: Record<string, string> = {},
+    sessionID = 'ses_one',
+    eventModel: { providerID: string; id: string } = model,
+  ) {
+    const event: any = {
+      sessionID,
+      model: eventModel,
+      kind: 'primary',
+      request: messagesRequest(headers),
+    }
+    await hooks.get('http.request')!(event)
+    return event.request as Request
+  }
+
+  async function answer(
+    hooks: Map<string, (event: any) => Promise<void> | void>,
+    request: Request,
+    response: Response,
+  ) {
+    const event: any = {
+      sessionID: 'ses_one',
+      model,
+      kind: 'primary',
+      request,
+      response,
+    }
+    await hooks.get('http.response')!(event)
+    return event.response as Response
+  }
+
+  test('sends a request on the credential the header names, and strips the header', async () => {
+    const { ctx, sessionHooks, accessOf } = twoAccounts()
+    await plugin.setup(ctx as any)
+
+    const sent = await send(sessionHooks, {
+      'x-opencode-credential-id': 'cred-b',
+    })
+
+    expect(sent.headers.get('authorization')).toBe(
+      `Bearer ${accessOf['cred-b']}`,
+    )
+    expect(sent.headers.has('x-opencode-credential-id')).toBe(false)
+    expect(ctx.integration.connection.active).not.toHaveBeenCalled()
+  })
+
+  test('without the header, sends on the active connection', async () => {
+    const { ctx, sessionHooks, accessOf } = twoAccounts()
+    await plugin.setup(ctx as any)
+
+    const sent = await send(sessionHooks)
+
+    expect(sent.headers.get('authorization')).toBe(
+      `Bearer ${accessOf['cred-a']}`,
+    )
+  })
+
+  test('fails closed on a credential that is not a connection, sending nothing', async () => {
+    const { ctx, sessionHooks } = twoAccounts()
+    await plugin.setup(ctx as any)
+    const event: any = {
+      sessionID: 'ses_one',
+      model,
+      kind: 'primary',
+      request: messagesRequest({ 'x-opencode-credential-id': 'cred-gone' }),
+    }
+
+    await expect(sessionHooks.get('http.request')!(event)).rejects.toThrow(
+      'not a connection of this integration',
+    )
+    expect(event.request.headers.has('authorization')).toBe(false)
+    expect(ctx.integration.connection.resolve).not.toHaveBeenCalled()
+  })
+
+  test('strips the header even when no OAuth login handles the request', async () => {
+    const { ctx, sessionHooks } = createMockContext()
+    await plugin.setup(ctx as any)
+
+    const sent = await send(sessionHooks, { 'x-opencode-credential-id': '' })
+
+    expect(sent.headers.has('x-opencode-credential-id')).toBe(false)
+    expect(sent.headers.has('authorization')).toBe(false)
+  })
+
+  test('names the session with a stable v4-shaped id that differs per session', async () => {
+    const { ctx, sessionHooks } = twoAccounts()
+    await plugin.setup(ctx as any)
+
+    const first = (await send(sessionHooks, {}, 'ses_one')).headers.get(
+      'x-claude-code-session-id',
+    )
+    const again = (await send(sessionHooks, {}, 'ses_one')).headers.get(
+      'x-claude-code-session-id',
+    )
+    const other = (await send(sessionHooks, {}, 'ses_two')).headers.get(
+      'x-claude-code-session-id',
+    )
+
+    expect(first).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
+    expect(again).toBe(first)
+    expect(other).not.toBe(first)
+    expect(first).not.toContain('ses_one')
+  })
+
+  test("sends the model's beta set", async () => {
+    const { ctx, sessionHooks } = twoAccounts()
+    await plugin.setup(ctx as any)
+
+    const haiku = await send(sessionHooks, {}, 'ses_one', {
+      providerID: 'anthropic',
+      id: 'claude-haiku-4-5',
+    })
+    const betas = haiku.headers.get('anthropic-beta')!.split(',')
+
+    expect(betas).toContain('claude-code-20250219')
+    expect(betas).toContain('oauth-2025-04-20')
+    expect(betas).toContain('context-management-2025-06-27')
+    expect(betas).not.toContain('interleaved-thinking-2025-05-14')
+  })
+
+  test('reads the quota headers of a successful response and serves them over RPC', async () => {
+    const { ctx, sessionHooks, rpcEvents, rpcHandlers, accessOf } =
+      twoAccounts()
+    await plugin.setup(ctx as any)
+    const sent = await send(sessionHooks, {
+      'x-opencode-credential-id': 'cred-b',
+    })
+    const fiveHourReset = Date.now() + 2 * HOUR
+    const weeklyReset = Date.now() + 50 * HOUR
+
+    await answer(
+      sessionHooks,
+      sent,
+      new Response('event: message_stop\ndata: {}\n\n', {
+        headers: {
+          'content-type': 'text/event-stream',
+          'anthropic-ratelimit-unified-status': 'allowed',
+          'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+          'anthropic-ratelimit-unified-5h-utilization': '0.4',
+          'anthropic-ratelimit-unified-5h-reset': seconds(fiveHourReset),
+          'anthropic-ratelimit-unified-7d-utilization': '0.25',
+          'anthropic-ratelimit-unified-7d-reset': seconds(weeklyReset),
+        },
+      }),
+    )
+
+    expect(rpcEvents).toHaveLength(1)
+    const event = rpcEvents[0]!
+    expect(event.id).toBe('credential-quota.anthropic')
+    expect(event.name).toBe('reading')
+    expect(event.payload.credentialID).toBe('cred-b')
+    expect(event.payload.reading.status).toBe('allowed')
+    expect(event.payload.reading.windows).toEqual([
+      {
+        name: '5h',
+        utilization: 0.4,
+        resetAt: Math.floor(fiveHourReset / 1000) * 1000,
+      },
+      {
+        name: '7d',
+        utilization: 0.25,
+        resetAt: Math.floor(weeklyReset / 1000) * 1000,
+      },
+    ])
+    const served = (await rpcHandlers.get('credential-quota.anthropic')!
+      .reading!({ credentialID: 'cred-b' })) as any
+    expect(served.reading).toEqual(event.payload.reading)
+    const none = (await rpcHandlers.get('credential-quota.anthropic')!.reading!(
+      { credentialID: 'cred-a' },
+    )) as any
+    expect(none.reading).toBeNull()
+    for (const access of Object.values(accessOf)) {
+      expect(JSON.stringify(rpcEvents)).not.toContain(access)
+    }
+  })
+
+  test('a plan-limit 429 refuses the credential until the rejected window resets', async () => {
+    const { ctx, sessionHooks, rpcEvents } = twoAccounts()
+    await plugin.setup(ctx as any)
+    const sent = await send(sessionHooks, {
+      'x-opencode-credential-id': 'cred-a',
+    })
+    const reset = Date.now() + 3 * HOUR
+
+    const response = await answer(
+      sessionHooks,
+      sent,
+      Response.json(
+        {
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            message: 'You have reached your session usage limit.',
+          },
+        },
+        {
+          status: 429,
+          headers: {
+            'retry-after': '10800',
+            'anthropic-ratelimit-unified-status': 'rejected',
+            'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+            'anthropic-ratelimit-unified-reset': seconds(reset),
+            'anthropic-ratelimit-unified-5h-utilization': '0.97',
+            'anthropic-ratelimit-unified-5h-reset': seconds(reset),
+            'anthropic-ratelimit-unified-7d-utilization': '0.3',
+            'anthropic-ratelimit-unified-7d-reset': seconds(
+              Date.now() + 90 * HOUR,
+            ),
+          },
+        },
+      ),
+    )
+
+    expect(response.headers.get('x-should-retry')).toBe('false')
+    const reading = rpcEvents.at(-1)!.payload.reading
+    expect(rpcEvents.at(-1)!.payload.credentialID).toBe('cred-a')
+    expect(reading.status).toBe('rejected')
+    expect(reading.windows[0]).toMatchObject({ name: '5h', utilization: 1 })
+    expect(reading.refusal).toEqual({
+      kind: 'usage-limit',
+      until: Math.floor(reset / 1000) * 1000,
+    })
+  })
+
+  test('a transient 429 refuses the credential for its retry-after', async () => {
+    const { ctx, sessionHooks, rpcEvents } = twoAccounts()
+    await plugin.setup(ctx as any)
+    const sent = await send(sessionHooks, {
+      'x-opencode-credential-id': 'cred-b',
+    })
+    const before = Date.now()
+
+    await answer(
+      sessionHooks,
+      sent,
+      Response.json(
+        {
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            message:
+              'Number of requests has exceeded your per-minute rate limit',
+          },
+        },
+        { status: 429, headers: { 'retry-after': '20' } },
+      ),
+    )
+
+    const refusal = rpcEvents.at(-1)!.payload.reading.refusal
+    expect(refusal.kind).toBe('rate-limit')
+    expect(refusal.until).toBeGreaterThanOrEqual(before + 20_000)
+    expect(refusal.until).toBeLessThanOrEqual(Date.now() + 20_000)
+  })
+
+  test('a 401 refuses the credential until the host refreshes its token', async () => {
+    const { ctx, sessionHooks, rpcEvents, expires } = twoAccounts()
+    await plugin.setup(ctx as any)
+    const sent = await send(sessionHooks, {
+      'x-opencode-credential-id': 'cred-b',
+    })
+
+    await answer(
+      sessionHooks,
+      sent,
+      Response.json(
+        {
+          type: 'error',
+          error: { type: 'authentication_error', message: 'invalid token' },
+        },
+        { status: 401 },
+      ),
+    )
+
+    expect(rpcEvents.at(-1)!.payload).toEqual({
+      credentialID: 'cred-b',
+      reading: expect.objectContaining({
+        refusal: { kind: 'unauthorized', until: expires - 5 * 60_000 },
+      }),
+    })
+  })
+
+  test('a login whose token cannot be resolved is refused, and the request fails', async () => {
+    const { ctx, sessionHooks, rpcEvents } = twoAccounts()
+    ;(ctx.integration.connection.resolve as any).mockImplementation(
+      async () => {
+        throw new Error(
+          'Anthropic token refresh blocked after ambiguous failure: 503',
+        )
+      },
+    )
+    await plugin.setup(ctx as any)
+    const event: any = {
+      sessionID: 'ses_one',
+      model,
+      kind: 'primary',
+      request: messagesRequest({ 'x-opencode-credential-id': 'cred-a' }),
+    }
+
+    await expect(sessionHooks.get('http.request')!(event)).rejects.toThrow(
+      'ambiguous failure',
+    )
+    const refusal = rpcEvents.at(-1)!.payload.reading.refusal
+    expect(rpcEvents.at(-1)!.payload.credentialID).toBe('cred-a')
+    expect(refusal.kind).toBe('signin')
+    expect(refusal.until).toBeGreaterThan(Date.now() + 29 * 60_000)
+  })
+
+  test('reads the usage endpoint for one credential and keeps a live refusal', async () => {
+    const { ctx, sessionHooks, rpcHandlers, rpcEvents, accessOf } =
+      twoAccounts()
+    await plugin.setup(ctx as any)
+    const sent = await send(sessionHooks, {
+      'x-opencode-credential-id': 'cred-a',
+    })
+    await answer(
+      sessionHooks,
+      sent,
+      Response.json(
+        {
+          type: 'error',
+          error: { type: 'rate_limit_error', message: 'Rate limited.' },
+        },
+        { status: 429, headers: { 'retry-after': '600' } },
+      ),
+    )
+    const fiveHourReset = new Date(Date.now() + HOUR).toISOString()
+    const seen: Request[] = []
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      seen.push(new Request(input as string, init))
+      return Response.json({
+        five_hour: { utilization: 62, resets_at: fiveHourReset },
+        seven_day: { utilization: 15, resets_at: null },
+        seven_day_opus: null,
+      })
+    }) as typeof fetch)
+    try {
+      const answered = (await rpcHandlers.get('credential-quota.anthropic')!
+        .usage!({ credentialID: 'cred-a' })) as any
+
+      expect(seen).toHaveLength(1)
+      expect(new URL(seen[0]!.url).pathname).toBe('/api/oauth/usage')
+      expect(seen[0]!.headers.get('authorization')).toBe(
+        `Bearer ${accessOf['cred-a']}`,
+      )
+      expect(seen[0]!.headers.get('anthropic-beta')).toBe('oauth-2025-04-20')
+      expect(answered.reading.windows).toEqual([
+        { name: '5h', utilization: 0.62, resetAt: Date.parse(fiveHourReset) },
+        { name: '7d', utilization: 0.15 },
+      ])
+      expect(answered.reading.refusal.kind).toBe('rate-limit')
+      expect(rpcEvents.at(-1)!.payload.reading).toEqual(answered.reading)
+    } finally {
+      fetchSpy.mockRestore()
+    }
   })
 })

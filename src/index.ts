@@ -1,6 +1,7 @@
 import { createHash, createHmac, type Hmac, randomBytes } from 'node:crypto'
 import { type Credential, Plugin } from '@opencode/plugin'
 import { authorize, exchange, refreshToken } from './auth.ts'
+import { OAUTH_BETA } from './betas.ts'
 import { BodyLimitError, contentLength, readBoundedText } from './bounded.ts'
 import {
   ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR,
@@ -14,11 +15,26 @@ import {
   REQUIRED_BETAS,
 } from './constants.ts'
 import {
+  type QuotaReading,
+  type QuotaRefusal,
+  quotaProtocol,
+  readUnifiedQuota,
+  readUsageBody,
+  rejectedUntil,
+  retryAfterUntil,
+} from './quota.ts'
+import {
   createConnectionLabel,
   describeConnection,
   enhanceRateLimitResponse,
+  type RateLimitCategory,
 } from './rate-limit.ts'
 import {
+  CLAUDE_CODE_SESSION_HEADER,
+  claudeCodeSessionID,
+} from './session-header.ts'
+import {
+  anthropicApiUrl,
   createStrippedStream,
   headersAfterBodyTransform,
   isInsecure,
@@ -52,6 +68,25 @@ const MAX_RECONSTRUCTED_ALIAS_LOOKUPS = 32
 const MAX_TRACKED_REQUEST_URL_BYTES = 8 * 1024
 const MAX_VERSION_GATE_RECOVERIES = 256
 const UNKNOWN_CONNECTION = 'Unknown OAuth connection'
+/**
+ * The request header another plugin sets in `model.request` to choose the
+ * credential a request goes out on: a connection id of the `anthropic`
+ * integration. It never reaches Anthropic.
+ */
+export const CREDENTIAL_HEADER = 'x-opencode-credential-id'
+const MAX_QUOTA_CREDENTIALS = 256
+/** A 401 holds the credential until the host refreshes it: this long before it expires. */
+const HOST_REFRESH_WINDOW_MS = 5 * 60_000
+const MIN_UNAUTHORIZED_HOLD_MS = 60_000
+const USAGE_PATH = '/api/oauth/usage'
+const USAGE_TIMEOUT_MS = 10_000
+const USAGE_MAX_BYTES = 64 * 1024
+/**
+ * A login whose token could not be resolved is retried after this long. A
+ * refresh whose outcome was unclear is never resent (`blockRefreshToken`),
+ * so the retry fails without a network call until the owner signs in again.
+ */
+const SIGNIN_RETRY_MS = 30 * 60_000
 const AMBIGUOUS_CONNECTION = 'Ambiguous OAuth connection'
 
 // setup() is location-scoped while the credential store is process-global.
@@ -165,26 +200,95 @@ function toCredential(exchanged: {
   }
 }
 
-async function resolveActiveOAuth(ctx: Plugin.Context): Promise<
-  | {
-      readonly connection: {
-        readonly type: string
-        readonly id?: string
-        readonly label?: string
-      }
-      readonly credential: Credential.OAuth
-    }
-  | undefined
+type OAuthConnection = {
+  readonly type: string
+  readonly id?: string
+  readonly label?: string
+}
+
+type ResolvedOAuth = {
+  readonly connection: OAuthConnection
+  readonly credential: Credential.OAuth
+}
+
+function connectionID(connection: OAuthConnection): string | undefined {
+  return connection.type === 'credential' ? connection.id : undefined
+}
+
+/**
+ * The connection `credentialID` names. A chosen credential that is not a
+ * connection of the integration fails the request: it never falls back to
+ * another account.
+ */
+async function chosenConnection(
+  ctx: Plugin.Context,
+  credentialID: string,
+): Promise<
+  Parameters<Plugin.Context['integration']['connection']['resolve']>[0]
 > {
-  const connection = await ctx.integration.connection.active(INTEGRATION_ID)
-  if (!connection) return undefined
-
-  const credential = await ctx.integration.connection.resolve(connection)
-  if (credential?.type === 'oauth' && credential.methodID === METHOD_ID) {
-    return { connection, credential }
+  const integration = await ctx.integration.get({
+    integrationID: INTEGRATION_ID,
+  })
+  const connection = integration.data.connections.find(
+    (entry) => entry.type === 'credential' && entry.id === credentialID,
+  )
+  if (!connection) {
+    throw new Error(
+      'The chosen Anthropic credential is not a connection of this integration',
+    )
   }
+  return connection
+}
 
-  return undefined
+/**
+ * Why a refused response's credential cannot take requests, and until when:
+ * a plan limit until the rejected window resets, a rate limit for its
+ * `retry-after`, and a rejected token until the host refreshes it.
+ */
+function refusalOf(input: {
+  readonly status: number
+  readonly category: RateLimitCategory | undefined
+  readonly headers: Headers
+  readonly quota: QuotaReading | undefined
+  readonly now: number
+  readonly expires: number | undefined
+}): QuotaRefusal | undefined {
+  if (input.status === 401) {
+    return {
+      kind: 'unauthorized',
+      until: Math.max(
+        input.now + MIN_UNAUTHORIZED_HOLD_MS,
+        (input.expires ?? 0) - HOST_REFRESH_WINDOW_MS,
+      ),
+    }
+  }
+  if (input.status !== 429) return undefined
+  const rejected = rejectedUntil(input.headers, input.quota)
+  const retryAfter = retryAfterUntil(input.headers, input.now)
+  if (
+    input.category === 'subscription-usage' ||
+    input.quota?.status === 'rejected'
+  ) {
+    const until = rejected ?? retryAfter
+    return { kind: 'usage-limit', ...(until === undefined ? {} : { until }) }
+  }
+  const until = retryAfter ?? rejected
+  return { kind: 'rate-limit', ...(until === undefined ? {} : { until }) }
+}
+
+/** The request without the credential-choice header, and the id it named. */
+function takeCredentialChoice(request: Request): {
+  readonly request: Request
+  readonly credentialID: string | undefined
+} {
+  const credentialID = request.headers.get(CREDENTIAL_HEADER)?.trim()
+  if (credentialID === undefined) return { request, credentialID: undefined }
+  const headers = new Headers(request.headers)
+  headers.delete(CREDENTIAL_HEADER)
+  return {
+    request: new Request(request, { headers }),
+    credentialID: credentialID === '' ? undefined : credentialID,
+  }
 }
 
 function hasTransformedOAuthShape(request: Request): boolean {
@@ -319,10 +423,12 @@ export default Plugin.define({
     let reconstructedAliasLookups = 0
     let setupActive = true
     const connectionByRequest = new WeakMap<Request, string>()
+    const credentialByRequest = new WeakMap<Request, string>()
     const connectionByAuthorization = new Map<
       string,
       {
         readonly description: string
+        readonly credentialID: string | undefined
         readonly timer: ReturnType<typeof setTimeout>
       }
     >()
@@ -330,8 +436,12 @@ export default Plugin.define({
     const rememberConnection = (
       request: Request,
       description: string,
+      credentialID: string | undefined,
     ): void => {
       connectionByRequest.set(request, description)
+      if (credentialID !== undefined) {
+        credentialByRequest.set(request, credentialID)
+      }
       const key = requestAuthorizationKey(request)
       if (!key) return
 
@@ -348,8 +458,15 @@ export default Plugin.define({
         !existing || existing.description === description
           ? description
           : AMBIGUOUS_CONNECTION
+      // One access token belongs to one credential; a token seen on two
+      // credentials names neither.
+      const retainedCredential =
+        !existing || existing.credentialID === credentialID
+          ? credentialID
+          : undefined
       let entry!: {
         readonly description: string
+        readonly credentialID: string | undefined
         readonly timer: ReturnType<typeof setTimeout>
       }
       const timer = setTimeout(() => {
@@ -358,7 +475,11 @@ export default Plugin.define({
         }
       }, CONNECTION_TRACKING_TTL_MS)
       timer.unref?.()
-      entry = { description: retainedDescription, timer }
+      entry = {
+        description: retainedDescription,
+        credentialID: retainedCredential,
+        timer,
+      }
       connectionByAuthorization.set(key, entry)
     }
 
@@ -370,6 +491,84 @@ export default Plugin.define({
       return (
         connectionByAuthorization.get(key)?.description ?? UNKNOWN_CONNECTION
       )
+    }
+
+    const credentialForRequest = (request: Request): string | undefined => {
+      const direct = credentialByRequest.get(request)
+      if (direct) return direct
+      const key = requestAuthorizationKey(request)
+      if (!key) return undefined
+      return connectionByAuthorization.get(key)?.credentialID
+    }
+
+    // The newest quota reading of each credential, from its responses and
+    // usage reads, served over the quota protocol (`quota.ts`).
+    const readings = new Map<string, QuotaReading>()
+    const credentialExpiry = new Map<string, number>()
+    let emitReading:
+      | ((credentialID: string, reading: QuotaReading) => Promise<void>)
+      | undefined
+
+    const publishReading = (
+      credentialID: string,
+      reading: QuotaReading,
+    ): void => {
+      if (
+        !readings.has(credentialID) &&
+        readings.size >= MAX_QUOTA_CREDENTIALS
+      ) {
+        const oldest = readings.keys().next().value
+        if (oldest !== undefined) readings.delete(oldest)
+      }
+      readings.delete(credentialID)
+      readings.set(credentialID, reading)
+      void emitReading?.(credentialID, reading).catch(() => undefined)
+    }
+
+    const refuse = (credentialID: string, refusal: QuotaRefusal): void => {
+      const previous = readings.get(credentialID)
+      publishReading(credentialID, {
+        at: Date.now(),
+        ...(previous?.status ? { status: previous.status } : {}),
+        windows: previous?.windows ?? [],
+        refusal,
+      })
+    }
+
+    /**
+     * The OAuth login to send a request on: the chosen credential when
+     * another plugin named one, else the integration's active connection.
+     * A login whose token cannot be resolved (its refresh failed) is refused
+     * for a while, so a pool places no request on it.
+     */
+    const resolveOAuth = async (
+      credentialID: string | undefined,
+    ): Promise<ResolvedOAuth | undefined> => {
+      const connection =
+        credentialID === undefined
+          ? await ctx.integration.connection.active(INTEGRATION_ID)
+          : await chosenConnection(ctx, credentialID)
+      if (!connection) return undefined
+      const id = connectionID(connection)
+      let credential: Credential.Value | undefined
+      try {
+        credential = await ctx.integration.connection.resolve(connection)
+      } catch (error) {
+        if (id !== undefined) {
+          refuse(id, { kind: 'signin', until: Date.now() + SIGNIN_RETRY_MS })
+        }
+        throw error
+      }
+      if (credential?.type === 'oauth' && credential.methodID === METHOD_ID) {
+        if (id !== undefined) credentialExpiry.set(id, credential.expires)
+        return { connection, credential }
+      }
+      if (credentialID !== undefined) {
+        throw new Error(
+          'The chosen Anthropic credential is not a Claude Pro/Max login',
+        )
+      }
+      return undefined
     }
 
     const clearAliasLeaseTimer = (lease: AliasLease): void => {
@@ -633,13 +832,101 @@ export default Plugin.define({
       })
     })
 
+    /** Read the usage endpoint for one credential now: the pool's sweep. */
+    const readUsage = async (
+      credentialID: string,
+    ): Promise<QuotaReading | undefined> => {
+      const active = await resolveOAuth(credentialID)
+      if (!active) return undefined
+      const url = anthropicApiUrl(USAGE_PATH)
+      if (!isTrustedAnthropicUrl(url)) return undefined
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          authorization: `Bearer ${active.credential.access}`,
+          'anthropic-beta': OAUTH_BETA,
+          'user-agent': formatUserAgent(claudeCodeVersion),
+          accept: 'application/json',
+        },
+        redirect: 'error',
+        signal: AbortSignal.timeout(USAGE_TIMEOUT_MS),
+      })
+      const now = Date.now()
+      if (response.status === 401) {
+        await response.body?.cancel()
+        refuse(credentialID, {
+          kind: 'unauthorized',
+          until: Math.max(
+            now + MIN_UNAUTHORIZED_HOLD_MS,
+            active.credential.expires - HOST_REFRESH_WINDOW_MS,
+          ),
+        })
+        return readings.get(credentialID)
+      }
+      if (!response.ok) {
+        await response.body?.cancel()
+        return undefined
+      }
+      const body = await readBoundedText(
+        response.body,
+        USAGE_MAX_BYTES,
+        'Anthropic usage response',
+      )
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(body)
+      } catch {
+        return undefined
+      }
+      const reading = readUsageBody(parsed, now)
+      if (!reading) return undefined
+      // A usage read says nothing of a refusal: a held credential stays held
+      // until its refusal ends.
+      const previous = readings.get(credentialID)?.refusal
+      const kept =
+        previous && (previous.until === undefined || previous.until > now)
+          ? { ...reading, refusal: previous }
+          : reading
+      publishReading(credentialID, kept)
+      return kept
+    }
+
+    const credentialOf = (input: unknown): string => {
+      const id =
+        typeof input === 'object' && input !== null
+          ? (input as { credentialID?: unknown }).credentialID
+          : undefined
+      if (typeof id !== 'string' || id === '') {
+        throw new Error('credentialID is required')
+      }
+      return id
+    }
+
+    const quotaRegistration = await ctx.rpc.register(
+      quotaProtocol(INTEGRATION_ID),
+      {
+        reading: async (input) => ({
+          reading: readings.get(credentialOf(input)) ?? null,
+        }),
+        usage: async (input) => ({
+          reading: (await readUsage(credentialOf(input))) ?? null,
+        }),
+      },
+    )
+    emitReading = (credentialID, reading) =>
+      quotaRegistration.events.emit('reading', { credentialID, reading })
+
     await ctx.session.hook('http.request', async (event) => {
       if (!setupActive) return
       if (event.model.providerID !== INTEGRATION_ID) return
-      const active = await resolveActiveOAuth(ctx)
+      const choice = takeCredentialChoice(event.request)
+      event.request = choice.request
+      const active = await resolveOAuth(choice.credentialID)
       if (!setupActive || !active) return
       const { credential } = active
       const connectionDescription = describeConnection(active.connection)
+      const credentialID = connectionID(active.connection)
+      const sessionHeader = claudeCodeSessionID(event.sessionID)
 
       const request = event.request
       const rewritten = rewriteUrl(request)
@@ -657,7 +944,13 @@ export default Plugin.define({
 
       if (!transformsBody) {
         const headers = mergeHeaders(request)
-        setOAuthHeaders(headers, credential.access, claudeCodeVersion)
+        setOAuthHeaders(
+          headers,
+          credential.access,
+          claudeCodeVersion,
+          event.model.id,
+        )
+        headers.set(CLAUDE_CODE_SESSION_HEADER, sessionHeader)
         const routedRequest =
           rewritten.input instanceof Request
             ? rewritten.input
@@ -667,7 +960,7 @@ export default Plugin.define({
           signal: request.signal,
           redirect: 'error',
         })
-        rememberConnection(event.request, connectionDescription)
+        rememberConnection(event.request, connectionDescription, credentialID)
         return
       }
 
@@ -711,7 +1004,13 @@ export default Plugin.define({
       const headers = bodyChanged
         ? headersAfterBodyTransform(mergeHeaders(request))
         : mergeHeaders(request)
-      setOAuthHeaders(headers, credential.access, claudeCodeVersion)
+      setOAuthHeaders(
+        headers,
+        credential.access,
+        claudeCodeVersion,
+        event.model.id,
+      )
+      headers.set(CLAUDE_CODE_SESSION_HEADER, sessionHeader)
 
       const rewrittenRequest = new Request(rewritten.url.toString(), {
         method: request.method,
@@ -735,7 +1034,7 @@ export default Plugin.define({
       if (pathname === '/v1/messages') {
         transformedRequests.add(event.request)
       }
-      rememberConnection(event.request, connectionDescription)
+      rememberConnection(event.request, connectionDescription, credentialID)
     })
 
     await ctx.session.hook('http.response', async (event) => {
@@ -751,6 +1050,15 @@ export default Plugin.define({
         // A direct plugin-owned response survives a best-effort lease failure.
       }
       if (!ownedDirectly && !lease) return
+      const credentialID = credentialForRequest(event.request)
+      const now = Date.now()
+      const sentHeaders = event.response.headers
+      const quota = readUnifiedQuota(sentHeaders, now)
+      if (event.response.ok) {
+        if (credentialID !== undefined && quota) {
+          publishReading(credentialID, quota)
+        }
+      }
       if (!event.response.ok) {
         if (lease) releaseAliasLease(event.request, lease)
         if (!hasExplicitVersionOverride && event.response.status === 400) {
@@ -791,12 +1099,34 @@ export default Plugin.define({
             }
           }
         }
-        if (event.response.status === 429) {
+        const status = event.response.status
+        let category: RateLimitCategory | undefined
+        if (status === 429) {
           const enhanced = await enhanceRateLimitResponse(
             event.response,
             connectionForRequest(event.request),
           )
           event.response = enhanced.response
+          category = enhanced.category
+        }
+        if (credentialID !== undefined) {
+          const refusal = refusalOf({
+            status,
+            category,
+            headers: sentHeaders,
+            quota,
+            now,
+            expires: credentialExpiry.get(credentialID),
+          })
+          if (refusal || quota) {
+            publishReading(credentialID, {
+              ...(quota ?? {
+                at: now,
+                windows: readings.get(credentialID)?.windows ?? [],
+              }),
+              ...(refusal ? { refusal } : {}),
+            })
+          }
         }
         return
       }
@@ -822,6 +1152,8 @@ export default Plugin.define({
 
     return () => {
       setupActive = false
+      emitReading = undefined
+      void quotaRegistration.dispose?.()
       for (const lease of aliasesByFingerprint.values()) retireAliasLease(lease)
       aliasesByFingerprint.clear()
       for (const entry of connectionByAuthorization.values()) {
